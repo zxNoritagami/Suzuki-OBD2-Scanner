@@ -304,16 +304,23 @@ def parse_isotp_response(raw_response):
             if sf_len > 0 and len(raw_bytes) >= 1 + sf_len:
                 return raw_bytes[1:1 + sf_len]
         elif pci_type == 1:
-            # First frame
-            ff_len = ((raw_bytes[0] & 0x0F) << 8) | raw_bytes[1]
-            payload = raw_bytes[2:]
-            needed = ff_len - len(payload)
-            if needed > 0:
-                # Buscar consecutive frames en el resto
-                remaining = raw_bytes[2:]
-                # Ya tenemos parte del payload
-                pass
-            return raw_bytes[2:2 + ff_len] if len(raw_bytes) >= 2 + ff_len else raw_bytes[2:]
+            # First frame: dividir en frames por PCI y reensamblar
+            frames = [raw_bytes]
+            idx = 2 + (raw_bytes[0] & 0x0F) * 256 + raw_bytes[1]
+            idx = min(idx, len(raw_bytes))
+            cf_start = 2
+            while cf_start < len(raw_bytes):
+                cf = raw_bytes[cf_start:]
+                if cf and (cf[0] >> 4) & 0x0F == 2:
+                    frames.append(cf)
+                    cf_start += 1
+                    cf_start += cf[0] & 0x0F if (cf[0] & 0x0F) > 0 else 7
+                else:
+                    break
+            return _reassemble_isotp(frames)
+        elif pci_type == 2:
+            # Consecutive frame directo: tratar como frame unico
+            return _reassemble_isotp([raw_bytes])
 
     return raw_bytes
 
@@ -1314,7 +1321,7 @@ class DTCScanner:
                 ))
 
         except Exception as e:
-            pass
+            self.communicator._log(f"[DTCScanner] Error en read_suzuki_dtcs_from_2100: {e}")
 
         return dtcs
 
@@ -1355,7 +1362,8 @@ class DTCScanner:
                         prefix_type=prefix, is_pending=False,
                         is_permanent=False, module="ECM-Mode18"
                     ))
-            except Exception:
+            except Exception as e:
+                self.communicator._log(f"[DTCScanner] Error en Mode 18: {e}")
                 continue
 
         return dtcs
@@ -1658,6 +1666,8 @@ class SessionManager:
 
     def _stop_tester_present(self):
         self._running = False
+        if hasattr(self, '_tester_timer') and self._tester_timer and self._tester_timer.is_alive():
+            self._tester_timer.join(timeout=1.0)
 
     def _tester_loop(self):
         """Envia 0x3E cada 2s para evitar timeout de sesion."""
@@ -1776,8 +1786,8 @@ class TopologyScanner:
                 data = self._extract_hex_data(response)
                 if data:
                     info["part_number"] = data
-        except Exception:
-            pass
+        except Exception as e:
+            self.communicator._log(f"[TopologyScanner] Error leyendo F180 del {module.name}: {e}")
 
         # 22 F190 = Calibration ID / Software Version
         try:
@@ -1786,8 +1796,8 @@ class TopologyScanner:
                 data = self._extract_hex_data(response)
                 if data:
                     info["calibration"] = data
-        except Exception:
-            pass
+        except Exception as e:
+            self.communicator._log(f"[TopologyScanner] Error leyendo F190 del {module.name}: {e}")
 
         self.module_info[module.name] = info
 
@@ -1817,8 +1827,8 @@ class TopologyScanner:
                 except Exception:
                     pass
                 return " ".join(f"{b:02X}" for b in hex_bytes)
-        except Exception:
-            pass
+        except Exception as e:
+            self.communicator._log(f"[TopologyScanner] Error extrayendo datos hex: {e}")
         return None
 
     def stop_scan(self):
@@ -1860,6 +1870,7 @@ class SuzukiScannerEngine:
         self.proxy = SafeProxy(communicator)
         self.session = SessionManager(communicator)
         self.topology = TopologyScanner(communicator, self.safety)
+        self.dtc_scanner = DTCScanner(communicator)
 
         self._dtc_results: Dict[str, List[DTCRecord]] = {}
         self._topology_cache: Dict[SuzukiModule, ModuleStatus] = {}
@@ -2460,11 +2471,13 @@ class OBD2ConnectionManager:
         """Activa el watchdog que monitorea la salud de la conexion."""
         self._watchdog_active = True
         self._last_activity = time.time()
+        self._check_health()
 
     def _stop_watchdog(self):
         """Desactiva el watchdog."""
         self._watchdog_active = False
         if self._heartbeat_timer and self._heartbeat_timer.is_alive():
+            self._heartbeat_timer.cancel()
             self._heartbeat_timer = None
 
     def is_alive(self):
@@ -3304,10 +3317,14 @@ class DashboardManager(ctk.CTkFrame):
             panel.reset_all()
 
     def all_pids(self):
-        """Devuelve el conjunto completo de PIDs configurados en todas las secciones."""
+        """Devuelve el conjunto completo de PIDs configurados (unicos, ordenados)."""
+        seen = set()
         pids = []
         for section in self.config.values():
-            pids.extend(section["pids"])
+            for pid in section["pids"]:
+                if pid not in seen:
+                    seen.add(pid)
+                    pids.append(pid)
         return pids
 
     def get_active_pids(self):
@@ -3889,14 +3906,21 @@ class Application:
         view = self.views["monitors"]
         view.grid_columnconfigure(0, weight=1)
         view.grid_rowconfigure(0, weight=0)
-        view.grid_rowconfigure(1, weight=1)
+        view.grid_rowconfigure(1, weight=0)
+        view.grid_rowconfigure(2, weight=1)
+
+        # Boton de refresco
+        ctk.CTkButton(view, text="\u21bb  Refrescar Monitores",
+                      command=self._refresh_monitors, width=160,
+                      fg_color=SUZUKI_RED, hover_color=SUZUKI_RED_HOVER,
+                      font=("Consolas", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
         ctk.CTkLabel(view, text="Monitores de Emisiones (Readiness)",
                      font=("Consolas", 18, "bold"),
-                     text_color=COLOR_TEXT_PRIMARY).grid(row=0, column=0, sticky="w", pady=(0, 15))
+                     text_color=COLOR_TEXT_PRIMARY).grid(row=1, column=0, sticky="w", pady=(0, 15))
 
         monitor_frame = ctk.CTkFrame(view, fg_color=COLOR_BG_CARD)
-        monitor_frame.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        monitor_frame.grid(row=2, column=0, sticky="nsew", padx=0, pady=0)
         monitor_frame.grid_columnconfigure(1, weight=1)
         monitor_frame.grid_columnconfigure(2, weight=0)
 
@@ -3956,6 +3980,35 @@ class Application:
                                      text_color=COLOR_GREEN)
         self.mil_label.grid(row=len(monitors) + 2, column=0, columnspan=3,
                            sticky="ew", padx=15, pady=(0, 15))
+
+    def _refresh_monitors(self):
+        """Lee el estado MIL y readiness via OBD2 y actualiza la UI."""
+        if not self.communicator.is_connected():
+            self.console.append("ERROR: Conecte primero al vehiculo")
+            return
+
+        self.console.append("Leyendo estado de monitores de emisiones...")
+
+        # PID 01 01: MIL status + DTC count
+        value, error = self.pid_manager.query_pid("0101")
+        if value is not None and isinstance(value, str) and "MIL" in value:
+            mil_on = "True" in value or "True" in value
+            dtc_count = 0
+            import re
+            m = re.search(r'DTCs:(\d+)', value)
+            if m:
+                dtc_count = int(m.group(1))
+            self.mil_label.configure(
+                text=f"MIL: {'ON' if mil_on else 'OFF'}  |  DTCs: {dtc_count}",
+                text_color=COLOR_RED if mil_on else COLOR_GREEN)
+
+            for key in self.monitor_widgets:
+                if key == "MIL":
+                    self.monitor_widgets[key]["icon"].configure(
+                        text_color=COLOR_RED if mil_on else COLOR_GREEN)
+                    self.monitor_widgets[key]["status"].configure(
+                        text="ON" if mil_on else "OFF",
+                        text_color=COLOR_RED if mil_on else COLOR_GREEN)
 
     # ==========================================================================
     # VISTA: SETTINGS
@@ -4187,6 +4240,9 @@ class Application:
 
     def _stop_live_data(self):
         self._live_data_running = False
+        if self._live_data_thread and self._live_data_thread.is_alive():
+            self._live_data_thread.join(timeout=2.0)
+            self._live_data_thread = None
         self.dashboard.reset_all()
 
     def _live_data_loop(self):
