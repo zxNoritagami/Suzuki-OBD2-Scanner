@@ -222,6 +222,149 @@ def decode_distance_ab(data): return (data[0] * 256) + data[1]
 def decode_raw_hex(data): return " ".join(f"{b:02X}" for b in data)
 def decode_fuel_rate_ab(data): return ((data[0] * 256) + data[1]) * 0.05
 
+# ==============================================================================
+# SUZUKI MODE 21 - ISO-TP PARSER
+# ==============================================================================
+# El Baleno 2019+ NO soporta OBD2 estandar (Mode 01).
+# Usa Suzuki-proprietary Mode 21 sobre CAN (7E0/7E8) a 500kbps.
+# Las respuestas multi-frame usan ISO-TP (ISO 15765-2).
+
+def parse_isotp_response(raw_response):
+    """
+    Parsea respuesta ISO-TP multi-frame del ELM327.
+
+    Maneja multiples formatos de salida ELM327 v1.5:
+      ATS1 (spaces ON):  "7E8 10 92 61 00 FF FF ..."
+      ATS0 (spaces OFF): "7E810926100FFFFFFFF..."
+      Sin headers:        "61 00 FF FF ..." o "6100FFFFFFFF..."
+
+    ISO-TP PCI types:
+      0x0N: Single Frame, N=data length
+      0x1N: First Frame, NNN=data length (12-bit)
+      0x2N: Consecutive Frame, N=sequence number
+      0x3N: Flow Control
+
+    Retorna: bytes con el payload completo (incluyendo SID+PID).
+    """
+    # Limpiar respuesta: quitar >, \r, \n, espacios extra
+    clean = raw_response.replace(">", "").replace("\r", "").replace("\n", " ").strip()
+
+    # Extraer todos los tokens hex (con o sin headers CAN)
+    tokens = clean.split()
+
+    if not tokens:
+        return b""
+
+    # Buscar donde empiezan los datos ISO-TP
+    # Formato con header CAN: [7E8] [PCI] [len...] [61] [00] [data...]
+    # Formato sin header: [61] [00] [data...]
+
+    frames = []
+
+    # Estrategia 1: Buscar lineas que empiecen con 7E8 (con ATH1)
+    for line in raw_response.replace("\r", "\n").split("\n"):
+        line = line.strip().replace(">", "").strip()
+        if not line:
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+
+        # Si empieza con 7E8, es un frame CAN
+        if parts[0].upper() == "7E8":
+            hex_bytes = "".join(parts[1:])  # Todo despues del ID
+            if hex_bytes:
+                try:
+                    frame_data = bytes.fromhex(hex_bytes)
+                    frames.append(frame_data)
+                except ValueError:
+                    pass
+
+    if frames:
+        return _reassemble_isotp(frames)
+
+    # Estrategia 2: Sin headers CAN - buscar respuesta directa (61 xx ...)
+    all_hex = "".join(tokens)
+    try:
+        raw_bytes = bytes.fromhex(all_hex)
+    except ValueError:
+        return b""
+
+    # Verificar si empieza con 61 (Mode 21 response) o 43/47/4A (DTC response)
+    if raw_bytes and raw_bytes[0] in (0x61, 0x43, 0x47, 0x4A, 0x59):
+        # Respuesta simple (single frame sin PCI)
+        return raw_bytes
+
+    # Intentar parsear como ISO-TP desde bytes crudos
+    if len(raw_bytes) >= 2:
+        pci_type = (raw_bytes[0] >> 4) & 0x0F
+        if pci_type == 0:
+            # Single frame
+            sf_len = raw_bytes[0] & 0x0F
+            if sf_len > 0 and len(raw_bytes) >= 1 + sf_len:
+                return raw_bytes[1:1 + sf_len]
+        elif pci_type == 1:
+            # First frame
+            ff_len = ((raw_bytes[0] & 0x0F) << 8) | raw_bytes[1]
+            payload = raw_bytes[2:]
+            needed = ff_len - len(payload)
+            if needed > 0:
+                # Buscar consecutive frames en el resto
+                remaining = raw_bytes[2:]
+                # Ya tenemos parte del payload
+                pass
+            return raw_bytes[2:2 + ff_len] if len(raw_bytes) >= 2 + ff_len else raw_bytes[2:]
+
+    return raw_bytes
+
+
+def _reassemble_isotp(frames):
+    """Reensambla frames ISO-TP en payload completo."""
+    if not frames:
+        return b""
+
+    first = frames[0]
+    if not first:
+        return b""
+
+    pci_type = (first[0] >> 4) & 0x0F
+
+    if pci_type == 0:
+        # Single Frame: PCI byte = 0x0N where N = data length
+        sf_len = first[0] & 0x0F
+        return first[1:1 + sf_len] if len(first) >= 1 + sf_len else first[1:]
+
+    if pci_type == 1:
+        # First Frame: PCI = 0x1N, length = NNN (12-bit)
+        total_len = ((first[0] & 0x0F) << 8) | first[1]
+        payload = bytearray(first[2:])
+
+        for cf_frame in frames[1:]:
+            pci_cf = (cf_frame[0] >> 4) & 0x0F
+            if pci_cf == 2:
+                # Consecutive Frame: PCI = 0x2N, skip PCI byte
+                payload.extend(cf_frame[1:])
+            if len(payload) >= total_len:
+                break
+
+        return bytes(payload[:total_len])
+
+    if pci_type == 2:
+        # Consecutive Frame directo (sin First Frame)
+        payload = bytearray(first[1:])
+        for cf_frame in frames[1:]:
+            pci_cf = (cf_frame[0] >> 4) & 0x0F
+            if pci_cf == 2:
+                payload.extend(cf_frame[1:])
+            elif pci_cf == 0:
+                # Otro single frame
+                sf_len = cf_frame[0] & 0x0F
+                payload.extend(cf_frame[1:1 + sf_len])
+        return bytes(payload)
+
+    # Fallback: concatenar todo
+    return b"".join(frames)
+
 GENERIC_PIDS = {
     "0100": PIDDefinition("01", "00", "PIDs_Supported_01_20", "PIDs soportados 01-20", 4, "bitmask", decode_raw_hex),
     "0101": PIDDefinition("01", "01", "DTC_Count", "Numero de DTCs y estado MIL", 4, "count/mask", lambda d: f"DTCs:{d[0]&0x7F}, MIL:{bool(d[0]&0x80)}"),
@@ -309,7 +452,311 @@ SUZUKI_SPECIFIC_PIDS = {
     "01E1": PIDDefinition("01", "E1", "SRS_Seatbelt_Status", "Estado cinturones", 1, "bitmask", lambda d: f"Seatbelts:{d[0]:08b}", category="Suzuki", module="SRS"),
 }
 
-ALL_PIDS = {**GENERIC_PIDS, **SUZUKI_SPECIFIC_PIDS}
+# ==============================================================================
+# SUZUKI MODE 21 - PIDs PROPRIETARIOS (CAN 7E0/7E8)
+# ==============================================================================
+# El Baleno 2019+ (ECU 33920-65GP, Bosch MEDC17) responde a Mode 21 sobre CAN.
+# Estos PIDs fueron descubiertos escaneando el ECU real.
+#
+# 2100 = Bloque principal de datos en vivo (141 bytes, ISO-TP multi-frame)
+#   Los bytes mapean a parametros internos del ECU.
+#   Offset 0-5:   Fault codes 1-6 (FF = sin DTCs)
+#   Offset 6-7:   RPM (high/low) - formula: (H*256+L)/5.1
+#   Offset 8:     Target idle
+#   Offset 9:     Vehicle speed (km/h directo)
+#   Offset 10:    Coolant temp - formula: (raw/255)*159-40
+#   Offset 11:    Intake air temp - formula: (raw/255)*159-40
+#   Offset 12:    TPS angle - formula: (raw/255)*100
+#   Offset 13:    TPS voltage - formula: (raw/255)*5
+#   Offset 14:    Injector pulse width high
+#   Offset 15:    Injector pulse width low
+#   Offset 16:    Ignition advance - formula: (raw/255)*90-12
+#   Offset 17:    MAP sensor - formula: (raw/255)*166.63-20
+#   Offset 18:    Barometric pressure
+#   Offset 19:    ISC duty
+#   Offset 20:    Battery voltage - formula: raw*0.0787
+#   Offset 22:    Status flags 1
+#
+# NOTA: Estos offsets son INCERTIDUMBRES basadas en suzuki_sdl.
+# Se necesita confirmar con el motor encendido. Se provee vista raw.
+
+def _decode_mode21_block(data):
+    """Decodifica el bloque 2100 en parametros individuales."""
+    if len(data) < 21:
+        return {"raw": " ".join(f"{b:02X}" for b in data)}
+    result = {}
+    if len(data) > 6:
+        rpm = int(((data[6] * 256) + data[7]) / 5.1)
+        result["RPM"] = rpm
+    if len(data) > 9:
+        result["Velocidad"] = data[9]
+    if len(data) > 10:
+        ect = round((data[10] / 255.0) * 159 - 40)
+        result["Temp.Ref"] = ect
+    if len(data) > 11:
+        iat = round((data[11] / 255.0) * 159 - 40)
+        result["Temp.Aire"] = iat
+    if len(data) > 12:
+        tps = round((data[12] / 255.0) * 100)
+        result["Acelerador"] = tps
+    if len(data) > 16:
+        adv = round(((data[16] / 255.0) * 90) - 12)
+        result["Avance"] = adv
+    if len(data) > 17:
+        map_kpa = round((data[17] / 255.0) * 166.63 - 20, 1)
+        result["MAP"] = map_kpa
+    if len(data) > 20:
+        bat = round(data[20] * 0.0787, 2)
+        result["Bateria"] = bat
+    if len(data) > 22:
+        result["Flags"] = f"0x{data[22]:02X}"
+    return result
+
+def _extract_rpm_2100(data):
+    if len(data) > 7:
+        return int(((data[6] * 256) + data[7]) / 5.1)
+    return 0
+
+def _extract_speed_2100(data):
+    if len(data) > 9:
+        return data[9]
+    return 0
+
+def _extract_coolant_temp_2100(data):
+    if len(data) > 10:
+        return round((data[10] / 255.0) * 159 - 40)
+    return 0
+
+def _extract_intake_temp_2100(data):
+    if len(data) > 11:
+        return round((data[11] / 255.0) * 159 - 40)
+    return 0
+
+def _extract_tps_2100(data):
+    if len(data) > 12:
+        return round((data[12] / 255.0) * 100)
+    return 0
+
+def _extract_timing_2100(data):
+    if len(data) > 16:
+        return round(((data[16] / 255.0) * 90) - 12)
+    return 0
+
+def _extract_map_2100(data):
+    if len(data) > 17:
+        return round((data[17] / 255.0) * 166.63 - 20, 1)
+    return 0.0
+
+def _extract_battery_2100(data):
+    if len(data) > 20:
+        return round(data[20] * 0.0787, 2)
+    return 0.0
+
+SUZUKI_MODE21_PIDS = {
+    "S21_00": PIDDefinition(
+        "21", "00", "Mode21_Live_Data",
+        "Datos en vivo Suzuki (bloque completo)",
+        141, "block", _decode_mode21_block,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_RPM": PIDDefinition(
+        "21", "00", "S21_RPM",
+        "RPM del motor (2100 offset 6-7)",
+        2, "rpm", _extract_rpm_2100,
+        min_val=0, max_val=8000,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_SPD": PIDDefinition(
+        "21", "00", "S21_Velocidad",
+        "Velocidad (2100 offset 9)",
+        2, "km/h", _extract_speed_2100,
+        min_val=0, max_val=220,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_ECT": PIDDefinition(
+        "21", "00", "S21_Coolant_Temp",
+        "Temp. refrigerante (2100 offset 10)",
+        2, "\u00b0C", _extract_coolant_temp_2100,
+        min_val=-40, max_val=120,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_IAT": PIDDefinition(
+        "21", "00", "S21_Intake_Temp",
+        "Temp. aire admision (2100 offset 11)",
+        2, "\u00b0C", _extract_intake_temp_2100,
+        min_val=-40, max_val=120,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_TPS": PIDDefinition(
+        "21", "00", "S21_Throttle",
+        "Pos. acelerador (2100 offset 12)",
+        2, "%", _extract_tps_2100,
+        min_val=0, max_val=100,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_ADV": PIDDefinition(
+        "21", "00", "S21_Timing",
+        "Avance encendido (2100 offset 16)",
+        2, "\u00b0", _extract_timing_2100,
+        min_val=-12, max_val=78,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_MAP": PIDDefinition(
+        "21", "00", "S21_MAP",
+        "Presion colector (2100 offset 17)",
+        2, "kPa", _extract_map_2100,
+        min_val=0, max_val=200,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_BAT": PIDDefinition(
+        "21", "00", "S21_Battery",
+        "Voltaje bateria (2100 offset 20)",
+        2, "V", _extract_battery_2100,
+        min_val=0, max_val=18,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_27": PIDDefinition(
+        "21", "27", "Mode21_Data_Block_27",
+        "Bloque de datos adicional 0x27",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_28": PIDDefinition(
+        "21", "28", "Mode21_Data_Block_28",
+        "Bloque de datos adicional 0x28",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_30": PIDDefinition(
+        "21", "30", "Mode21_Data_Block_30",
+        "Bloque calibracion 0x30",
+        41, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_31": PIDDefinition(
+        "21", "31", "Mode21_Data_Block_31",
+        "Bloque calibracion 0x31",
+        41, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_32": PIDDefinition(
+        "21", "32", "Mode21_Status_32",
+        "Estado 0x32",
+        5, "raw", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_33": PIDDefinition(
+        "21", "33", "Mode21_Status_33",
+        "Estado 0x33",
+        5, "raw", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_34": PIDDefinition(
+        "21", "34", "Mode21_Data_Block_34",
+        "Bloque de datos 0x34",
+        19, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_35": PIDDefinition(
+        "21", "35", "Mode21_Data_Block_35",
+        "Bloque de datos 0x35",
+        26, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_36": PIDDefinition(
+        "21", "36", "Mode21_Status_36",
+        "Estado 0x36",
+        5, "raw", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_3C": PIDDefinition(
+        "21", "3C", "Mode21_Data_Block_3C",
+        "Bloque de datos 0x3C",
+        26, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_3D": PIDDefinition(
+        "21", "3D", "Mode21_Status_3D",
+        "Estado 0x3D",
+        5, "raw", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_40": PIDDefinition(
+        "21", "40", "Mode21_Data_Block_40",
+        "Bloque de datos 0x40",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_41": PIDDefinition(
+        "21", "41", "Mode21_Data_Block_41",
+        "Bloque de datos 0x41",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_42": PIDDefinition(
+        "21", "42", "Mode21_Data_Block_42",
+        "Bloque de datos 0x42",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_43": PIDDefinition(
+        "21", "43", "Mode21_Data_Block_43",
+        "Bloque de datos 0x43",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_44": PIDDefinition(
+        "21", "44", "Mode21_Data_Block_44",
+        "Bloque de datos 0x44",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_45": PIDDefinition(
+        "21", "45", "Mode21_Data_Block_45",
+        "Bloque de datos 0x45",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_46": PIDDefinition(
+        "21", "46", "Mode21_Data_Block_46",
+        "Bloque de datos 0x46",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_47": PIDDefinition(
+        "21", "47", "Mode21_Data_Block_47",
+        "Bloque de datos 0x47",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_48": PIDDefinition(
+        "21", "48", "Mode21_Data_Block_48",
+        "Bloque de datos 0x48",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_49": PIDDefinition(
+        "21", "49", "Mode21_Data_Block_49",
+        "Bloque de datos 0x49",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_A2": PIDDefinition(
+        "21", "A2", "Mode21_Data_Block_A2",
+        "Bloque de datos 0xA2",
+        69, "block", decode_raw_hex,
+        category="Suzuki Mode 21", module="ECM"
+    ),
+    "S21_D0": PIDDefinition(
+        "21", "D0", "Mode21_ECU_ID",
+        "Identificacion ECU",
+        77, "string",
+        lambda d: d[1:76].decode("ascii", errors="replace").rstrip("\x00"),
+        category="Suzuki Mode 21", module="ECM"
+    ),
+}
+
+ALL_PIDS = {**GENERIC_PIDS, **SUZUKI_SPECIFIC_PIDS, **SUZUKI_MODE21_PIDS}
 
 SUZUKI_DTC_DATABASE = {
     "P1105": "Barometric Pressure Circuit Malfunction",
@@ -515,12 +962,19 @@ class PIDManager:
         self.communicator = communicator
         self.last_values = {}
         self.supported_pids = set()
+        self._mode21_cache = {}  # {pid_hex: (isotp_data, timestamp)}
 
     def query_pid(self, pid_key):
         if pid_key not in ALL_PIDS:
             return None, f"PID {pid_key} no definido"
 
         pid_def = ALL_PIDS[pid_key]
+
+        # --- Suzuki Mode 21 (CAN 7E0/7E8) ---
+        if pid_def.category == "Suzuki Mode 21":
+            return self._query_mode21_pid(pid_key, pid_def)
+
+        # --- OBD2 Estandar / Suzuki Mode 01 ---
         module = None
         if pid_def.category == "Suzuki":
             for mod in SuzukiModule:
@@ -534,7 +988,7 @@ class PIDManager:
             return None, f"No data: {response.strip()}"
 
         # Parsear respuesta
-        lines = response.strip().split("\\r")
+        lines = response.strip().split("\r")
         data_line = ""
         for line in lines:
             line = line.strip()
@@ -579,6 +1033,126 @@ class PIDManager:
             return value, None
         except Exception as e:
             return None, f"Error decodificando: {e}"
+
+    def _query_mode21_pid(self, pid_key, pid_def):
+        """Consulta un PID Suzuki Mode 21 sobre CAN (ISO-TP multi-frame)."""
+        try:
+            cmd = f"{pid_def.mode}{pid_def.pid.zfill(2)}"
+            now = time.time()
+
+            # Asegurar que el header CAN apunta al ECM
+            if not hasattr(self, '_last_module') or self._last_module != "ECM":
+                self.communicator.send_command("ATSH7E0")
+                self._last_module = "ECM"
+
+            # Verificar cache (300ms TTL para datos en vivo mas fluidos)
+            cache_key = pid_def.pid.upper()
+            if cache_key in self._mode21_cache:
+                cached_data, cached_ts = self._mode21_cache[cache_key]
+                if now - cached_ts < 0.3:
+                    isotp_data = cached_data
+                    value = self._decode_mode21_data(isotp_data, pid_key, pid_def)
+                    if value is not None:
+                        self.last_values[pid_key] = {
+                            "value": value,
+                            "unit": pid_def.unit,
+                            "timestamp": now,
+                            "name": pid_def.name,
+                            "description": pid_def.description,
+                        }
+                        return value, None
+
+            # Enviar comando al ECU
+            response = self.communicator.send_command(cmd, timeout=3.0)
+
+            if "NO DATA" in response or "ERROR" in response or "UNABLE" in response:
+                return None, f"No data: {response.strip()[:80]}"
+
+            # Parsear ISO-TP
+            isotp_data = parse_isotp_response(response)
+
+            # Fallback: si parse_isotp no funciono, intentar parseo manual
+            if not isotp_data or len(isotp_data) < 2:
+                isotp_data = self._fallback_parse_mode21(response)
+
+            if not isotp_data or len(isotp_data) < 2:
+                return None, "Respuesta Mode 21 vacia o incompleta"
+
+            # Guardar en cache
+            self._mode21_cache[cache_key] = (isotp_data, now)
+
+            # Decodificar
+            value = self._decode_mode21_data(isotp_data, pid_key, pid_def)
+            if value is not None:
+                self.last_values[pid_key] = {
+                    "value": value,
+                    "unit": pid_def.unit,
+                    "timestamp": now,
+                    "name": pid_def.name,
+                    "description": pid_def.description,
+                }
+                return value, None
+
+            return None, "No se pudo decodificar Mode 21"
+
+        except Exception as e:
+            return None, f"Error Mode 21: {e}"
+
+    def _fallback_parse_mode21(self, response):
+        """Parseo manual cuando parse_isotp_response falla."""
+        for line in response.replace("\r", "\n").split("\n"):
+            line = line.strip().replace(">", "").strip()
+            if not line:
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+
+            # Formato con header CAN: 7E8 10 XX 61 00 ...
+            if parts[0].upper() == "7E8" and len(parts) > 2:
+                try:
+                    # Quitar ID CAN, tomar todo lo demas
+                    hex_str = "".join(parts[1:])
+                    raw = bytes.fromhex(hex_str)
+                    # Buscar 61 (Mode 21 response) en los bytes
+                    for i in range(len(raw)):
+                        if raw[i] == 0x61 and i + 1 < len(raw):
+                            return raw[i:]  # 61 + PID + data
+                except ValueError:
+                    pass
+
+            # Formato sin headers: 61 00 ...
+            if parts[0] == "61" or (len(parts[0]) == 2 and parts[0][0] == "6"):
+                try:
+                    hex_str = "".join(parts)
+                    return bytes.fromhex(hex_str)
+                except ValueError:
+                    pass
+
+        return b""
+
+    def _decode_mode21_data(self, isotp_data, pid_key, pid_def):
+        """Decodifica datos ISO-TP segun el tipo de PID."""
+        # Para el bloque principal 0x00 (con decoder custom)
+        if pid_def.unit == "block" and pid_def.decode_func != decode_raw_hex:
+            # Saltar SID (61) + PID (00) = offset 2
+            data_slice = isotp_data[2:] if len(isotp_data) > 2 else isotp_data
+            return pid_def.decode_func(data_slice)
+
+        # Para PIDs virtuales de 2100 (RPM, SPD, ECT, etc.)
+        if pid_def.unit not in ("block", "string", "raw") and pid_def.decode_func != decode_raw_hex:
+            data_slice = isotp_data[2:] if len(isotp_data) > 2 else isotp_data
+            return pid_def.decode_func(list(data_slice))
+
+        # Para string (ECU ID, etc.)
+        if pid_def.unit == "string":
+            return pid_def.decode_func(list(isotp_data))
+
+        # Para raw/block (otros PIDs Mode 21)
+        data_bytes = list(isotp_data[2:]) if len(isotp_data) > 2 else list(isotp_data)
+        if len(data_bytes) < pid_def.bytes_count and pid_def.unit != "string":
+            return None
+        return pid_def.decode_func(data_bytes[:pid_def.bytes_count] if pid_def.unit != "string" else data_bytes)
 
     def query_supported_pids(self):
         self.supported_pids = set()
@@ -631,7 +1205,7 @@ class DTCScanner:
         if "NO DATA" in response or "ERROR" in response:
             return dtcs
 
-        lines = response.strip().split("\\r")
+        lines = response.strip().split("\r")
         for line in lines:
             line = line.strip().replace(" ", "")
             if not line or line == ">" or len(line) < 6:
@@ -685,7 +1259,106 @@ class DTCScanner:
     def clear_dtcs(self):
         """Borra todos los DTCs."""
         response = self.communicator.send_command("04")
-        return "OK" in response or "44" in response
+        return "OK" in response or "44" in response
+
+    def read_suzuki_dtcs_from_2100(self):
+        """
+        Lee DTCs del bloque Mode 21 0x00 (Suzuki-proprietary).
+
+        En el Baleno, los primeros 6 bytes del bloque 2100 son DTCs:
+          Bytes 0-3 (addr 0x00-0x03): DTCs 1-4
+          Bytes 24-25 (addr 0x20-0x21): DTCs 5-6
+
+        Fuerza una lectura fresca ignorando cache.
+        """
+        dtcs = []
+        try:
+            # Forzar lectura fresca (sin cache)
+            pid_def = ALL_PIDS.get("S21_00")
+            if not pid_def:
+                return dtcs
+
+            # Enviar 2100 directamente
+            response = self.communicator.send_command("2100", timeout=3.0)
+            if "NO DATA" in response or "ERROR" in response:
+                return dtcs
+
+            isotp_data = parse_isotp_response(response)
+            if not isotp_data or len(isotp_data) < 6:
+                return dtcs
+
+            # DTCs en bytes 2-7 del payload (post SID+PID)
+            # SDL addresses 0x00-0x03 = DTCs 1-4
+            # SDL addresses 0x20-0x21 = DTCs 5-6 (may need offset calc)
+
+            # Parse DTC pairs from the data
+            dtc_offsets = [2, 4, 6, 8]  # DTC1 at data[2:4], DTC2 at data[4:6], etc.
+
+            for offset in dtc_offsets:
+                if offset + 1 >= len(isotp_data):
+                    break
+                b1 = isotp_data[offset]
+                b2 = isotp_data[offset + 1]
+                if b1 == 0xFF and b2 == 0xFF:
+                    continue  # Empty slot
+                if b1 == 0x00 and b2 == 0x00:
+                    continue  # Empty slot
+                code = self._parse_dtc_bytes(b1, b2)
+                desc = self._get_dtc_description(code)
+                cat = DTC_CATEGORIES.get(code[0], "Unknown")
+                prefix = DTC_PREFIXES.get(code[:2], "Unknown")
+                dtcs.append(DTCRecord(
+                    code=code, description=desc, category=cat,
+                    prefix_type=prefix, is_pending=False,
+                    is_permanent=False, module="ECM-Mode21"
+                ))
+
+        except Exception as e:
+            pass
+
+        return dtcs
+
+    def read_suzuki_dtcs_mode18(self):
+        """
+        Lee DTCs extendidos Suzuki via Mode 0x18 (Suzuki-proprietary).
+
+        Algunos ECUs Suzuki responden a Mode 18 con sub-funciones:
+          18 00 FF = Report all DTCs (status mask = 0xFF)
+          18 02 FF = Report DTCs con snapshot data
+        """
+        dtcs = []
+        for subcmd in ["1800FF", "1802FF"]:
+            try:
+                response = self.communicator.send_command(subcmd, timeout=2.0)
+                if "NO DATA" in response or "ERROR" in response or "7F" in response:
+                    continue
+
+                # Parse response
+                data = parse_isotp_response(response)
+                if not data or len(data) < 3:
+                    continue
+
+                # Skip response header (mode 58 + subfunction)
+                start = 3 if len(data) > 3 else 2
+                for i in range(start, len(data) - 1, 2):
+                    b1, b2 = data[i], data[i + 1]
+                    if b1 == 0xFF and b2 == 0xFF:
+                        continue
+                    if b1 == 0x00 and b2 == 0x00:
+                        continue
+                    code = self._parse_dtc_bytes(b1, b2)
+                    desc = self._get_dtc_description(code)
+                    cat = DTC_CATEGORIES.get(code[0], "Unknown")
+                    prefix = DTC_PREFIXES.get(code[:2], "Unknown")
+                    dtcs.append(DTCRecord(
+                        code=code, description=desc, category=cat,
+                        prefix_type=prefix, is_pending=False,
+                        is_permanent=False, module="ECM-Mode18"
+                    ))
+            except Exception:
+                continue
+
+        return dtcs
 # ==============================================================================
 # MOTOR DE DIAGNOSTICO SUZUKI - SUZUKI SCANNER ENGINE
 # ==============================================================================
@@ -1274,34 +1947,64 @@ class SuzukiScannerEngine:
         """
         Lee DTCs de un modulo especifico usando el protocolo adecuado.
 
-        UDS (0x19): para modulos en bus Safety CAN-UDS o Gateway
-        OBD2 (0x03): para modulos estandar en Powertrain/Chassis/Body CAN
+        Para el ECM del Baleno:
+          1. Intenta Mode 03 (OBD2 estandar)
+          2. Intenta Mode 18 (Suzuki extendido)
+          3. Intenta Mode 21 0x00 (DTCs embebidos en bloque de datos)
+
+        Para otros modulos:
+          UDS (0x19): para modulos en bus Safety CAN-UDS o Gateway
+          OBD2 (0x03): para modulos estandar
         """
         self.communicator.set_module(module)
 
         dtcs = []
-        is_uds = "UDS" in module.bus
 
-        if is_uds:
-            # UDS: 0x19 02 = ReadDTCInformation / status of DTC
-            # 0x19 0A = ReadDTCInformation / supported DTC
-            # 0x19 0B = ReadDTCInformation / first DTC
-            for subfunc in ["0A", "0B"]:
-                try:
-                    response = self.communicator.send_command(f"19{subfunc}", timeout=1.0)
-                    parsed = self._parse_uds_dtcs(response, module)
-                    dtcs.extend(parsed)
-                except Exception:
-                    continue
-        else:
-            # OBD2 estandar: Modo 03 (stored), 07 (pending), 0A (permanent)
+        if module == SuzukiModule.ECM:
+            # ===== ECM: Multi-metodo para Baleno =====
+            # Metodo 1: OBD2 estandar Mode 03
             for mode, is_pending, is_permanent in [("03", False, False), ("07", True, False), ("0A", False, True)]:
                 try:
-                    response = self.communicator.send_command(mode, timeout=1.0)
+                    response = self.communicator.send_command(mode, timeout=2.0)
                     parsed = self._parse_obd2_dtcs(response, module, is_pending, is_permanent)
                     dtcs.extend(parsed)
                 except Exception:
                     continue
+
+            # Metodo 2: Suzuki Mode 18 (extendido)
+            if not dtcs:
+                try:
+                    parsed = self.dtc_scanner.read_suzuki_dtcs_mode18()
+                    dtcs.extend(parsed)
+                except Exception:
+                    pass
+
+            # Metodo 3: DTCs embebidos en Mode 21 0x00
+            if not dtcs:
+                try:
+                    parsed = self.dtc_scanner.read_suzuki_dtcs_from_2100()
+                    dtcs.extend(parsed)
+                except Exception:
+                    pass
+        else:
+            is_uds = "UDS" in module.bus
+
+            if is_uds:
+                for subfunc in ["0A", "0B"]:
+                    try:
+                        response = self.communicator.send_command(f"19{subfunc}", timeout=1.0)
+                        parsed = self._parse_uds_dtcs(response, module)
+                        dtcs.extend(parsed)
+                    except Exception:
+                        continue
+            else:
+                for mode, is_pending, is_permanent in [("03", False, False), ("07", True, False), ("0A", False, True)]:
+                    try:
+                        response = self.communicator.send_command(mode, timeout=1.0)
+                        parsed = self._parse_obd2_dtcs(response, module, is_pending, is_permanent)
+                        dtcs.extend(parsed)
+                    except Exception:
+                        continue
 
         return dtcs
 
@@ -1312,7 +2015,7 @@ class SuzukiScannerEngine:
         if "NO DATA" in response or "ERROR" in response or not response:
             return dtcs
 
-        lines = response.strip().split("\\r")
+        lines = response.strip().split("\r")
         for line in lines:
             line = line.strip().replace(" ", "")
             if not line or line == ">" or len(line) < 6:
@@ -1354,7 +2057,7 @@ class SuzukiScannerEngine:
         if "NO DATA" in response or "ERROR" in response or "7F" in response or not response:
             return dtcs
 
-        lines = response.strip().split("\\r")
+        lines = response.strip().split("\r")
         for line in lines:
             line = line.strip().replace(" ", "")
             if not line or line == ">" or len(line) < 6:
@@ -1438,7 +2141,7 @@ class SuzukiScannerEngine:
         if "NO DATA" in response or "ERROR" in response:
             return None
 
-        lines = response.strip().split("\\r")
+        lines = response.strip().split("\r")
         for line in lines:
             line = line.strip()
             if not line or line == ">":
@@ -1619,6 +2322,7 @@ class OBD2ConnectionManager:
     def _open_port(self):
         """Abre el puerto COM probando varios baudrates."""
         bauds_to_try = [self.config.baudrate] + [b for b in BAUD_RATES if b != self.config.baudrate]
+        old_port = self.serial_port
 
         for baud in bauds_to_try:
             try:
@@ -1636,15 +2340,17 @@ class OBD2ConnectionManager:
                 time.sleep(0.5)
 
                 # ATZ: Reset del ELM327 - devuelve "ELM327 vX.X" si funciona
+                self.serial_port = port
                 response = self._send_raw("ATZ", timeout=3.0)
                 if "ELM" in response or ">" in response:
                     self.config.baudrate = baud
-                    self.serial_port = port
                     self._log(f"Puerto abierto @ {baud} baud")
                     return True
                 else:
+                    self.serial_port = old_port
                     port.close()
             except Exception:
+                self.serial_port = old_port
                 try:
                     port.close()
                 except Exception:
@@ -1654,28 +2360,28 @@ class OBD2ConnectionManager:
 
     def _negotiate_protocol(self):
         """
-        Negociacion jerarquica del protocolo OBD2.
+        Negociacion del protocolo para Suzuki Baleno 2019+.
 
-        Jerarquia:
-        1. Cache local (si existe para esta MAC)
-        2. AT SP 6 (CAN 11-bit 500kbps - 80% de los vehiculos post-2008)
-        3. AT SP 0 (barrido completo de los 9 protocolos)
+        El Baleno NO soporta OBD2 estandar (Mode 01).
+        Usa Suzuki-proprietary Mode 21 sobre CAN (7E0/7E8) a 500kbps.
+        Requiere ATH1 (headers ON) para parsear ISO-TP multi-frame.
         """
-        # ATE0: Echo OFF - evita que el comando se refleje en la respuesta
-        # ATL1: Linefeeds ON - agrega \\n despues de \\r para mejor parseo
-        # ATS0: Spaces OFF - elimina espacios en respuestas numericas
-        # ATH0: Headers OFF - omite cabeceras CAN en respuestas
-        # ATCAF1: CAN Auto Format ON - formatea automaticamente tramas CAN
-        # ATCFC1: CAN Flow Control ON - activa control de flujo CAN
-        # ATST96: Set Timeout a 960ms (valor por defecto)
+        # Paso 1: Reset limpio del ELM327
+        self._log("Reseteando ELM327...")
+        self._send_raw("ATZ", timeout=3.0)
+        time.sleep(1.0)
+
+        # Paso 2: Configuracion base
         base_cmds = [
             ("ATE0", "Echo OFF"),
             ("ATL1", "Linefeeds ON"),
-            ("ATS0", "Spaces OFF"),
-            ("ATH0", "Headers OFF"),
+            ("ATS1", "Spaces ON (necesario para parser)"),
+            ("ATH1", "Headers ON (NECESARIO para ISO-TP multi-frame)"),
+            ("ATSP6", "Protocolo CAN 11bit 500k"),
             ("ATCAF1", "CAN Auto Format ON"),
             ("ATCFC1", "CAN Flow Control ON"),
-            ("ATST96", "Set Timeout 960ms"),
+            ("ATST96", "Timeout 960ms"),
+            ("ATSH7E0", "CAN Header ECM (7E0)"),
         ]
 
         for cmd, desc in base_cmds:
@@ -1684,60 +2390,46 @@ class OBD2ConnectionManager:
                 self._log(f"ADVERTENCIA: {desc} fallo: {response.strip()}")
             time.sleep(0.05)
 
-        # --- NIVEL 1: Intentar protocolo cacheado ---
-        cached_proto = self._get_cached_protocol(self._adapter_mac)
-        if cached_proto:
-            self._log(f"Cache encontrado: intentando protocolo {cached_proto}")
-            # AT SP <n>: fuerza el protocolo n
-            response = self._send_raw(f"ATSP{cached_proto}")
-            time.sleep(0.2)
-            # Verificar con 0100 (Current Data - pide PIDs soportados)
-            test = self._send_raw("0100")
-            if "NO DATA" not in test and "UNABLE" not in test:
-                self.current_protocol = cached_proto
-                self._log(f"Protocolo {cached_proto} recuperado de cache")
-                self.state = ConnectionState.CONNECTED
-                self._start_watchdog()
-                return True
-            else:
-                self._log(f"Protocolo cacheado {cached_proto} fallo, probando fallback...")
+        # Paso 3: Verificar con Mode 21 PID 0x00 (Suzuki-proprietary)
+        self._log("Verificando conexion con Suzuki Mode 21...")
+        test = self._send_raw("2100", timeout=3.0)
+        self._log(f"Test 2100: {test.strip()[:120]}")
 
-        # --- NIVEL 2: Fallback comun - CAN 11-bit 500k ---
-        # AT SP 6: ISO 15765-4 CAN (11 bit ID, 500 kbaud) - estandar global
-        self._log("Intentando protocolo CAN 11-bit 500k (AT SP 6)...")
-        response = self._send_raw("ATSP6")
-        time.sleep(0.2)
-        test = self._send_raw("0100")
-        if "NO DATA" not in test and "UNABLE" not in test:
+        if "7E8" in test or "6100" in test or "61" in test:
             self.current_protocol = "6"
-            self._log("Protocolo detectado: CAN 11-bit 500k")
-            self._set_cached_protocol(self._adapter_mac, "6")
+            self._log("Suzuki Mode 21 detectado exitosamente!")
             self.state = ConnectionState.CONNECTED
             self._start_watchdog()
             return True
 
-        # --- NIVEL 3: Barrido completo ---
-        # AT SP 0: escanea automaticamente los 9 protocolos OBD2
-        # Esto toma ~5-10 segundos pero garantiza compatibilidad total
-        self._log("Ejecutando barrido completo de protocolos (AT SP 0)...")
-        response = self._send_raw("ATSP0")
-        time.sleep(1.0)
+        # Paso 4: Fallback - intentar OBD2 estandar
+        self._log("Mode 21 no respondio, probando OBD2 estandar...")
+        self._send_raw("ATSH7DF", timeout=1.0)  # Broadcast para test OBD2
+        test = self._send_raw("0100", timeout=3.0)
+        if "NO DATA" not in test and "UNABLE" not in test and "7E8" in test:
+            self._log("OBD2 estandar detectado (no Baleno)")
+            self._send_raw("ATSH7E0")  # Restaurar header ECM
+            self.current_protocol = "6"
+            self.state = ConnectionState.CONNECTED
+            self._start_watchdog()
+            return True
 
-        for _ in range(30):
-            response = self._send_raw("0100")
-            if "NO DATA" not in response and "UNABLE" not in response:
-                detected = self._send_raw("ATDPN")
-                # ATDPN: devuelve el numero del protocolo activo
-                self.current_protocol = detected.strip().split()[-1] if detected.strip() else "6"
-                self._log(f"Protocolo detectado via barrido: {self.current_protocol}")
-                self._set_cached_protocol(self._adapter_mac, self.current_protocol)
-                self.state = ConnectionState.CONNECTED
-                self._start_watchdog()
-                return True
-            time.sleep(0.3)
-
-        self._log("ADVERTENCIA: No se pudo detectar protocolo, usando CAN 11bit 500k")
+        # Paso 5: Forzar CAN de todas formas (puede tardar en responder)
+        self._log("Forzando CAN Protocolo 6...")
+        self._send_raw("ATSH7E0")
         self._send_raw("ATSP6")
+        time.sleep(0.5)
+
+        test = self._send_raw("2100", timeout=5.0)
+        if "7E8" in test or "61" in test:
+            self.current_protocol = "6"
+            self._log("Suzuki Mode 21 detectado (retry)!")
+            self.state = ConnectionState.CONNECTED
+            self._start_watchdog()
+            return True
+
+        # Ultimo recurso: marcar conectado de todas formas
+        self._log("Usando CAN Protocolo 6 (fallback sin confirmacion)")
         self.current_protocol = "6"
         self.state = ConnectionState.CONNECTED
         self._start_watchdog()
@@ -1779,8 +2471,8 @@ class OBD2ConnectionManager:
         """
         Verifica que el adaptador responde (latido).
 
-        Envia ATZ (consulta de identificacion) si no ha habido actividad
-        en los ultimos HEARTBEAT_INTERVAL segundos.
+        Usa ATRV (lectura de voltaje) que NO modifica la configuracion.
+        ATZ NO se usa porque resetea el ELM327 y borra ATSP6/ATH1/etc.
         """
         now = time.time()
         if now - self._last_activity < self.HEARTBEAT_INTERVAL:
@@ -1794,17 +2486,12 @@ class OBD2ConnectionManager:
             return False
 
         try:
-            # ATZ: comando de diagnostico rapido, devuelve "ELM327 vX.X"
-            response = self._send_raw("ATZ", timeout=2.0)
-            ok = "ELM" in response or ">" in response
+            # ATRV: lee voltaje de bateria - NO modifica configuracion
+            response = self._send_raw("ATRV", timeout=2.0)
+            ok = "V" in response or ">" in response
             if ok:
                 self._last_activity = now
                 self._recovery_attempts = 0
-                # Re-aplicar configuracion basica post-reset
-                self._send_raw("ATE0")
-                self._send_raw("ATL1")
-                self._send_raw("ATS0")
-                self._send_raw("ATH0")
             return ok
         except Exception:
             return False
@@ -2071,7 +2758,7 @@ class ELM327Simulator:
             return f"{self.simulation_data['battery_voltage']:.1f}V\\r\\r>"
         if cmd == "ATI":
             return "ELM327 v1.5\\r\\r>"
-        if cmd in ("ATL1", "ATS0", "ATCAF1", "ATCFC1", "ATD", "ATST96", "ATPB96"):
+        if cmd in ("ATL1", "ATS1", "ATCAF1", "ATCFC1", "ATD", "ATST96", "ATPB96"):
             return "OK\\r\\r>"
 
         if cmd.startswith("ATSH"):
@@ -2172,43 +2859,13 @@ class ELM327Simulator:
 DASHBOARD_SECTIONS = {
     "Engine": {
         "icon": "\u26a1",
-        "pids": ["010C", "0104", "0105", "0111", "010E", "015C"],
+        "pids": ["S21_RPM", "S21_SPD", "S21_ECT", "S21_IAT", "S21_TPS", "S21_MAP"],
         "layout": (2, 3),
     },
-    "Air & Fuel": {
+    "Fuel & Timing": {
         "icon": "\ud83c\udf2c",
-        "pids": ["010F", "010B", "0110", "0144", "0106", "0107"],
-        "layout": (2, 3),
-    },
-    "Electrical": {
-        "icon": "\u26a1",
-        "pids": ["0142", "0146", "0143", "0145", "012F"],
-        "layout": (2, 3),
-    },
-    "Transmission": {
-        "icon": "\u2699",
-        "pids": ["01A0", "01A3", "01A4", "01A5", "01A6", "01A7", "01A8"],
-        "layout": (3, 3),
-    },
-    "Chassis": {
-        "icon": "\ud83d\udece",
-        "pids": ["01B0", "01B1", "01B2", "01B3", "01B4", "01B5", "01B6", "01B7"],
-        "layout": (3, 3),
-    },
-    "EPS & SRS": {
-        "icon": "\ud83d\udee1",
-        "pids": ["01C0", "01C1", "01C2", "01C3", "01E0", "01E1"],
-        "layout": (2, 3),
-    },
-    "Body": {
-        "icon": "\ud83d\udeaa",
-        "pids": ["01D0", "01D1", "01D2", "01D3", "01D4"],
-        "layout": (2, 3),
-    },
-    "General": {
-        "icon": "\ud83d\udcca",
-        "pids": ["010D", "011F", "0162", "0163", "015E", "014D", "014E"],
-        "layout": (3, 3),
+        "pids": ["S21_ADV", "S21_BAT"],
+        "layout": (1, 2),
     },
 }
 
