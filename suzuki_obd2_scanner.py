@@ -2163,6 +2163,504 @@ class ELM327Simulator:
 
 
 # ==============================================================================
+# DASHBOARD MODULAR - CONFIGURACION DE SECCIONES
+# ==============================================================================
+# Cada seccion agrupa PIDs que se renderizan como graficos de linea en vivo.
+# Formato: {nombre: {icon, pids: [pid_key, ...], layout: (filas, columnas)}}
+# ==============================================================================
+
+DASHBOARD_SECTIONS = {
+    "Engine": {
+        "icon": "\u26a1",
+        "pids": ["010C", "0104", "0105", "0111", "010E", "015C"],
+        "layout": (2, 3),
+    },
+    "Air & Fuel": {
+        "icon": "\ud83c\udf2c",
+        "pids": ["010F", "010B", "0110", "0144", "0106", "0107"],
+        "layout": (2, 3),
+    },
+    "Electrical": {
+        "icon": "\u26a1",
+        "pids": ["0142", "0146", "0143", "0145", "012F"],
+        "layout": (2, 3),
+    },
+    "Transmission": {
+        "icon": "\u2699",
+        "pids": ["01A0", "01A3", "01A4", "01A5", "01A6", "01A7", "01A8"],
+        "layout": (3, 3),
+    },
+    "Chassis": {
+        "icon": "\ud83d\udece",
+        "pids": ["01B0", "01B1", "01B2", "01B3", "01B4", "01B5", "01B6", "01B7"],
+        "layout": (3, 3),
+    },
+    "EPS & SRS": {
+        "icon": "\ud83d\udee1",
+        "pids": ["01C0", "01C1", "01C2", "01C3", "01E0", "01E1"],
+        "layout": (2, 3),
+    },
+    "Body": {
+        "icon": "\ud83d\udeaa",
+        "pids": ["01D0", "01D1", "01D2", "01D3", "01D4"],
+        "layout": (2, 3),
+    },
+    "General": {
+        "icon": "\ud83d\udcca",
+        "pids": ["010D", "011F", "0162", "0163", "015E", "014D", "014E"],
+        "layout": (3, 3),
+    },
+}
+
+CHART_COLORS = {
+    "rpm": "#00FF88",
+    "speed": "#00D4FF",
+    "temp": "#FF6B35",
+    "pressure": "#4FC3F7",
+    "voltage": "#FFD700",
+    "fuel": "#FF4081",
+    "position": "#AB47BC",
+    "timing": "#FFA726",
+    "flow": "#26C6DA",
+    "torque": "#66BB6A",
+    "current": "#EF5350",
+    "angle": "#7E57C2",
+    "default": "#00BCD4",
+}
+
+def _chart_color(pid_key):
+    pid_def = ALL_PIDS.get(pid_key)
+    if not pid_def:
+        return CHART_COLORS["default"]
+    name = pid_def.name.lower()
+    unit = pid_def.unit.lower()
+    if "rpm" in name or unit == "rpm":
+        return CHART_COLORS["rpm"]
+    if "temp" in name or unit == "c" or unit == "°c":
+        return CHART_COLORS["temp"]
+    if "speed" in name or unit == "km/h":
+        return CHART_COLORS["speed"]
+    if "press" in name or unit == "kpa":
+        return CHART_COLORS["pressure"]
+    if "volt" in name or unit == "v":
+        return CHART_COLORS["voltage"]
+    if "fuel" in name or "fuel" in unit:
+        return CHART_COLORS["fuel"]
+    if "throttle" in name or "position" in name or unit == "%":
+        return CHART_COLORS["position"]
+    if "timing" in name or "advance" in name:
+        return CHART_COLORS["timing"]
+    if "maf" in name or "flow" in name or "rate" in name:
+        return CHART_COLORS["flow"]
+    if "torque" in name:
+        return CHART_COLORS["torque"]
+    if "current" in name or unit == "a":
+        return CHART_COLORS["current"]
+    if "angle" in name or "yaw" in name:
+        return CHART_COLORS["angle"]
+    return CHART_COLORS["default"]
+
+
+# ==============================================================================
+# TREND CHART - Grafico de linea en vivo con Canvas
+# ==============================================================================
+
+class TrendChart(ctk.CTkFrame):
+    """
+    Grafico de linea en tiempo real con estilo automotriz oscuro.
+
+    Caracteristicas:
+    - Fondo oscuro con rejilla minimalista
+    - Linea de color neon segun tipo de PID
+    - Auto-escalado en Y con margen
+    - Ventana deslizante de 500 puntos
+    - Estado visual 'NO SIGNAL' cuando no hay datos
+    - Buffer interno con deque(maxlen=500)
+    """
+
+    PADDING = 40
+    X_LABEL_SPACE = 30
+    Y_TICK_COUNT = 5
+
+    def __init__(self, master, pid_key, title, unit,
+                 chart_color=None, min_val=None, max_val=None,
+                 window_seconds=30, **kwargs):
+        super().__init__(master, **kwargs)
+        self.pid_key = pid_key
+        self.title = title
+        self.unit = unit
+        self.chart_color = chart_color or _chart_color(pid_key)
+        self.min_val = min_val
+        self.max_val = max_val
+        self.window_seconds = window_seconds
+        self._data = deque(maxlen=500)
+        self._timestamps = deque(maxlen=500)
+        self._has_signal = False
+        self._no_data_count = 0
+        self._last_render = 0
+
+        self.configure(fg_color=COLOR_BG_CARD, border_width=1,
+                       border_color=COLOR_BORDER)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Header: titulo + valor actual + unidad
+        header = ctk.CTkFrame(self, fg_color="transparent", height=24)
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 0))
+        header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=0)
+
+        self.title_label = ctk.CTkLabel(
+            header, text=title.upper(),
+            font=("Consolas", 9, "bold"),
+            text_color=COLOR_TEXT_SECONDARY)
+        self.title_label.grid(row=0, column=0, sticky="w")
+
+        self.value_label = ctk.CTkLabel(
+            header, text="--",
+            font=("Consolas", 11, "bold"),
+            text_color=self.chart_color)
+        self.value_label.grid(row=0, column=1, sticky="e")
+
+        self.unit_label = ctk.CTkLabel(
+            header, text=unit,
+            font=("Consolas", 9),
+            text_color=COLOR_TEXT_SECONDARY)
+        self.unit_label.grid(row=0, column=2, sticky="e", padx=(4, 0))
+
+        # Canvas del grafico
+        self.canvas = ctk.CTkCanvas(
+            self, bg=COLOR_BG_CARD,
+            highlightthickness=0)
+        self.canvas.grid(row=1, column=0, sticky="nsew", padx=4, pady=(2, 4))
+
+        # NO SIGNAL overlay text (se dibuja en el canvas)
+        self._signal_text_id = None
+
+        # Bind resize
+        self.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event=None):
+        self._render()
+
+    def push_value(self, value):
+        """Inserta un valor en el buffer y actualiza el grafico."""
+        now = time.time()
+        self._timestamps.append(now)
+        self._data.append(value)
+        self._has_signal = True
+        self._no_data_count = 0
+        self.value_label.configure(text=f"{value:.1f}" if isinstance(value, float) else str(value))
+        self._render()
+
+    def mark_no_signal(self):
+        """Marca el grafico como 'Sin Senal' tras timeout de datos."""
+        self._no_data_count += 1
+        if self._no_data_count > 3 and self._has_signal:
+            self._has_signal = False
+            self.value_label.configure(text="NO SIGNAL")
+            self._render()
+
+    def _render(self):
+        """Renderiza el grafico en el Canvas."""
+        if not self.canvas.winfo_exists():
+            return
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w < 50 or h < 50:
+            return
+
+        self.canvas.delete("all")
+
+        pad = self.PADDING
+        plot_w = w - pad - self.X_LABEL_SPACE
+        plot_h = h - pad - 10
+        origin_x = pad
+        origin_y = 10
+        plot_top = origin_y
+        plot_bottom = origin_y + plot_h
+        plot_right = origin_x + plot_w
+
+        # No signal overlay
+        if not self._has_signal or len(self._data) == 0:
+            self.canvas.create_text(
+                w // 2, h // 2,
+                text="NO SIGNAL",
+                fill="#555555",
+                font=("Consolas", 16, "bold"),
+                anchor="center")
+            self.canvas.create_line(
+                origin_x, plot_bottom, plot_right, plot_bottom,
+                fill="#333333", width=1)
+            return
+
+        # Determinar rango Y
+        data_min = min(self._data) if not self.min_val else self.min_val
+        data_max = max(self._data) if not self.max_val else self.max_val
+        if data_min == data_max:
+            data_min -= 1
+            data_max += 1
+        y_range = data_max - data_min
+        y_margin = y_range * 0.1
+        y_min = data_min - y_margin
+        y_max = data_max + y_margin
+        if y_min == y_max:
+            y_max = y_min + 1
+
+        # Rejilla horizontal
+        for i in range(self.Y_TICK_COUNT + 1):
+            y = origin_y + plot_h * (1 - i / self.Y_TICK_COUNT)
+            self.canvas.create_line(
+                origin_x, y, plot_right, y,
+                fill="#2A2A3A", width=1)
+            val = y_min + (y_max - y_min) * i / self.Y_TICK_COUNT
+            self.canvas.create_text(
+                origin_x - 4, y,
+                text=f"{val:.0f}",
+                fill="#555555",
+                font=("Consolas", 7),
+                anchor="e")
+
+        # Eje X (linea base)
+        self.canvas.create_line(
+            origin_x, plot_bottom, plot_right, plot_bottom,
+            fill="#444444", width=1)
+
+        # Linea de datos
+        n = len(self._data)
+        if n < 2:
+            return
+
+        points = []
+        for i in range(n):
+            x = plot_right - (plot_w * (n - 1 - i) / max(n - 1, 1))
+            val = self._data[i]
+            if val < y_min:
+                y_clamped = plot_top
+            elif val > y_max:
+                y_clamped = plot_bottom
+            else:
+                y_clamped = plot_bottom - plot_h * (val - y_min) / (y_max - y_min)
+            points.extend([x, y_clamped])
+
+        if len(points) >= 4:
+            self.canvas.create_line(
+                *points, fill=self.chart_color,
+                width=2, smooth=True)
+
+    def clear_data(self):
+        self._data.clear()
+        self._timestamps.clear()
+        self._has_signal = False
+        self.value_label.configure(text="--")
+        self._render()
+
+
+# ==============================================================================
+# SECTION PANEL - Panel de graficos para una seccion del dashboard
+# ==============================================================================
+
+class SectionPanel(ctk.CTkScrollableFrame):
+    """
+    Panel que contiene una grilla de TrendCharts para una seccion.
+
+    Genera automaticamente los widgets segun la configuracion de PIDs,
+    los distribuye en un grid (filas x columnas) y expone metodos
+    para recibir datos enrutados.
+    """
+
+    def __init__(self, master, section_name, pid_keys, layout=(2, 2), **kwargs):
+        super().__init__(master, **kwargs)
+        self.section_name = section_name
+        self.pid_keys = pid_keys
+        self.layout = layout
+        self.charts = {}  # pid_key -> TrendChart
+
+        self.configure(fg_color="transparent")
+        self._build_grid()
+
+    def _build_grid(self):
+        rows, cols = self.layout
+        for r in range(rows):
+            self.grid_rowconfigure(r, weight=1)
+        for c in range(cols):
+            self.grid_columnconfigure(c, weight=1)
+
+        for idx, pid_key in enumerate(self.pid_keys):
+            if idx >= rows * cols:
+                break
+            r = idx // cols
+            c = idx % cols
+
+            pid_def = ALL_PIDS.get(pid_key)
+            if not pid_def:
+                continue
+
+            title = pid_def.name.replace("_", " ")
+            unit = pid_def.unit
+            color = _chart_color(pid_key)
+
+            chart = TrendChart(
+                self,
+                pid_key=pid_key,
+                title=title,
+                unit=unit,
+                chart_color=color,
+                min_val=pid_def.min_val,
+                max_val=pid_def.max_val,
+            )
+            chart.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+            self.charts[pid_key] = chart
+
+    def route_value(self, pid_key, value):
+        """Envia un valor al grafico correspondiente si pertenece a este panel."""
+        chart = self.charts.get(pid_key)
+        if chart:
+            chart.push_value(value)
+
+    def mark_no_signal(self, pid_key):
+        chart = self.charts.get(pid_key)
+        if chart:
+            chart.mark_no_signal()
+
+    def reset_all(self):
+        for chart in self.charts.values():
+            chart.clear_data()
+
+
+# ==============================================================================
+# DASHBOARD MANAGER - Navegacion por pestanas y enrutamiento de datos
+# ==============================================================================
+
+class DashboardManager(ctk.CTkFrame):
+    """
+    Gestor principal del dashboard modular.
+
+    - Crea una barra de pestanas laterales para cada seccion
+    - Muestra/oculta SectionPanels segun seleccion
+    - Enruta datos entrantes al panel y grafico correctos
+    - Mantiene buffers globales de datos para procesamiento batch
+    """
+
+    def __init__(self, master, config=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.config = config or DASHBOARD_SECTIONS
+        self.panels = {}        # section_name -> SectionPanel
+        self._active_section = None
+        self._nav_buttons = {}  # section_name -> CTkButton
+        self._last_active = None
+
+        self.configure(fg_color="transparent")
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # Barra de navegacion (pestanas verticales a la izquierda)
+        self.nav_frame = ctk.CTkFrame(self, fg_color=COLOR_BG_CARD,
+                                      width=160)
+        self.nav_frame.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        self.nav_frame.grid_propagate(False)
+        self.nav_frame.grid_columnconfigure(0, weight=1)
+
+        # Contenedor de paneles
+        self.panel_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.panel_container.grid(row=0, column=1, sticky="nsew")
+        self.panel_container.grid_columnconfigure(0, weight=1)
+        self.panel_container.grid_rowconfigure(0, weight=1)
+
+        self._build_navigation()
+        self._build_panels()
+
+        if self.config:
+            first = list(self.config.keys())[0]
+            self.show_section(first)
+
+    def _build_navigation(self):
+        ctk.CTkLabel(
+            self.nav_frame,
+            text="SECTIONS",
+            font=("Consolas", 10, "bold"),
+            text_color=COLOR_TEXT_SECONDARY
+        ).grid(row=0, column=0, pady=(12, 6))
+
+        for idx, (name, section) in enumerate(self.config.items()):
+            icon = section.get("icon", "")
+            btn = ctk.CTkButton(
+                self.nav_frame,
+                text=f"{icon} {name}",
+                command=lambda n=name: self.show_section(n),
+                fg_color="transparent",
+                hover_color="#1E2A45",
+                text_color=COLOR_TEXT_SECONDARY,
+                anchor="w",
+                font=("Consolas", 11),
+                height=32)
+            btn.grid(row=idx + 1, column=0, sticky="ew", padx=4, pady=2)
+            self._nav_buttons[name] = btn
+
+    def _build_panels(self):
+        for name, section in self.config.items():
+            panel = SectionPanel(
+                self.panel_container,
+                section_name=name,
+                pid_keys=section["pids"],
+                layout=section.get("layout", (2, 2)),
+                fg_color="transparent")
+            self.panels[name] = panel
+
+    def show_section(self, name):
+        """Activa una seccion, mostrando su panel y ocultando el resto."""
+        if name == self._active_section:
+            return
+        self._active_section = name
+
+        for n, panel in self.panels.items():
+            if n == name:
+                panel.grid(row=0, column=0, sticky="nsew")
+                panel.lift()
+            else:
+                panel.grid_remove()
+
+        for n, btn in self._nav_buttons.items():
+            if n == name:
+                btn.configure(fg_color="#1E2A45", text_color=COLOR_TEXT_PRIMARY,
+                              font=("Consolas", 11, "bold"))
+            else:
+                btn.configure(fg_color="transparent", text_color=COLOR_TEXT_SECONDARY,
+                              font=("Consolas", 11))
+
+    def route_value(self, pid_key, value):
+        """Enruta un valor al grafico correcto en la seccion que lo contiene."""
+        for panel in self.panels.values():
+            if pid_key in panel.charts:
+                panel.route_value(pid_key, value)
+                return
+
+    def mark_no_signal(self, pid_key):
+        for panel in self.panels.values():
+            if pid_key in panel.charts:
+                panel.mark_no_signal(pid_key)
+                return
+
+    def reset_all(self):
+        for panel in self.panels.values():
+            panel.reset_all()
+
+    def all_pids(self):
+        """Devuelve el conjunto completo de PIDs configurados en todas las secciones."""
+        pids = []
+        for section in self.config.values():
+            pids.extend(section["pids"])
+        return pids
+
+    def get_active_pids(self):
+        """Devuelve PIDs de la seccion activa."""
+        if self._active_section and self._active_section in self.config:
+            return self.config[self._active_section]["pids"]
+        return []
+
+
+# ==============================================================================
 # INTERFAZ GRAFICA - WIDGETS PERSONALIZADOS
 # ==============================================================================
 
@@ -2461,77 +2959,29 @@ class Application:
         self._show_view(key)
 
     # ==========================================================================
-    # VISTA: DASHBOARD
+    # VISTA: DASHBOARD (MODULAR POR SECCIONES)
     # ==========================================================================
 
     def _build_dashboard_view(self):
         view = self.views["dashboard"]
         view.grid_columnconfigure(0, weight=1)
-        view.grid_rowconfigure(0, weight=1)
-
-        canvas = ctk.CTkScrollableFrame(view, fg_color=COLOR_BG_DARK)
-        canvas.grid(row=0, column=0, sticky="nsew")
-
-        # Fila de medidores principales (6 tarjetas)
-        main_frame = ctk.CTkFrame(canvas, fg_color="transparent")
-        main_frame.pack(fill="x", padx=0, pady=(0, 10))
-        for i in range(6):
-            main_frame.grid_columnconfigure(i, weight=1)
-
-        self.gauges = {}
-        gauge_configs = [
-            ("010C", "RPM", "rpm", None, None),
-            ("010D", "Speed", "km/h", None, None),
-            ("0105", "Coolant", "\u00b0C", 95, 110),
-            ("0104", "Load", "%", 80, 100),
-            ("0111", "Throttle", "%", 80, 100),
-            ("0142", "Voltage", "V", 12.0, 11.5),
-        ]
-        for i, (pid_key, title, unit, warn, crit) in enumerate(gauge_configs):
-            card = GaugeCard(main_frame, title, unit, warning_thresh=warn, critical_thresh=crit,
-                             invert=(title == "Voltage"))
-            card.grid(row=0, column=i, padx=5, pady=5, sticky="nsew")
-            self.gauges[pid_key] = card
-
-        # Fila de parametros secundarios (grid 4 columnas)
-        secondary_frame = ctk.CTkFrame(canvas, fg_color="transparent")
-        secondary_frame.pack(fill="x", padx=0, pady=5)
-        for i in range(4):
-            secondary_frame.grid_columnconfigure(i, weight=1)
-
-        self.secondary_gauges = {}
-        secondary_configs = [
-            ("010F", "IAT", "\u00b0C"),
-            ("010B", "MAP", "kPa"),
-            ("0110", "MAF", "g/s"),
-            ("012F", "Fuel", "%"),
-            ("015C", "Oil Temp", "\u00b0C"),
-            ("0146", "Ambient", "\u00b0C"),
-            ("010E", "Timing", "\u00b0"),
-            ("0144", "A/F Ratio", "ratio"),
-        ]
-        for i, (pid_key, title, unit) in enumerate(secondary_configs):
-            row = i // 4
-            col = i % 4
-            card = GaugeCard(secondary_frame, title, unit)
-            card.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-            self.secondary_gauges[pid_key] = card
+        view.grid_rowconfigure(0, weight=0)
+        view.grid_rowconfigure(1, weight=1)
 
         # Botones de control del dashboard
-        ctrl_frame = ctk.CTkFrame(canvas, fg_color="transparent")
-        ctrl_frame.pack(fill="x", padx=0, pady=(10, 0))
+        ctrl_frame = ctk.CTkFrame(view, fg_color="transparent")
+        ctrl_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ctrl_frame.grid_columnconfigure(0, weight=1)
 
         self.scan_btn = ctk.CTkButton(ctrl_frame, text="\u25b6  Iniciar Scan",
                                       command=self._toggle_scan, width=160,
                                       fg_color=SUZUKI_RED, hover_color=SUZUKI_RED_HOVER,
                                       font=("Consolas", 12, "bold"))
-        self.scan_btn.pack(side="left", padx=5)
+        self.scan_btn.grid(row=0, column=0, sticky="w")
 
-        self.progress = ctk.CTkProgressBar(ctrl_frame, width=250,
-                                          fg_color=COLOR_BG_CARD,
-                                          progress_color=SUZUKI_RED)
-        self.progress.pack(side="left", padx=20)
-        self.progress.set(0)
+        # Dashboard modular con secciones
+        self.dashboard = DashboardManager(view)
+        self.dashboard.grid(row=1, column=0, sticky="nsew")
 
     # ==========================================================================
     # VISTA: DIAGNOSTICS (DTCs)
@@ -3057,7 +3507,7 @@ class Application:
         self.console.append("Desconectado")
 
     # ==========================================================================
-    # SCAN DE DATOS EN VIVO
+    # SCAN DE DATOS EN VIVO (MODULAR POR SECCIONES)
     # ==========================================================================
 
     def _toggle_scan(self):
@@ -3074,33 +3524,29 @@ class Application:
             return
         self._live_data_running = True
         self.scan_btn.configure(text="\u25a0  Detener Scan", fg_color="#555", hover_color="#444")
+        self.console.append("Iniciando scan de datos en vivo...")
         self._live_data_thread = threading.Thread(target=self._live_data_loop, daemon=True)
         self._live_data_thread.start()
 
     def _stop_live_data(self):
         self._live_data_running = False
+        self.dashboard.reset_all()
 
     def _live_data_loop(self):
-        """Loop de polling de datos en vivo. Prioridades implicitas por orden."""
-        primary_pids = ["010C", "010D", "0105", "0104", "0111", "0142"]
+        """Polling de datos en vivo sobre todos los PIDs configurados en secciones."""
+        all_pids = self.dashboard.all_pids()
+        if not all_pids:
+            return
 
         while self._live_data_running and self.communicator.is_connected():
-            # PIDs primarios (alta prioridad)
-            for pid_key in primary_pids:
+            for pid_key in all_pids:
                 if not self._live_data_running:
                     break
                 value, error = self.pid_manager.query_pid(pid_key)
-                if value is not None and pid_key in self.gauges:
-                    self.app.after(0, lambda k=pid_key, v=value: self.gauges[k].update_value(v))
-                time.sleep(0.05)
-
-            # PIDs secundarios (baja prioridad)
-            for pid_key in list(self.secondary_gauges.keys()):
-                if not self._live_data_running:
-                    break
-                value, error = self.pid_manager.query_pid(pid_key)
-                if value is not None and pid_key in self.secondary_gauges:
-                    self.app.after(0, lambda k=pid_key, v=value: self.secondary_gauges[k].update_value(v))
+                if value is not None:
+                    self.app.after(0, lambda k=pid_key, v=value: self.dashboard.route_value(k, v))
+                else:
+                    self.app.after(0, lambda k=pid_key: self.dashboard.mark_no_signal(k))
                 time.sleep(0.05)
 
             time.sleep(0.2)
